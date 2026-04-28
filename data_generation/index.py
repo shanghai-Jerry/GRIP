@@ -29,7 +29,7 @@ def build_elasticsearch(
 
     # create index
     print(f'create index {index_name}')
-    es.delete_index()
+    # es.delete_index()
     time.sleep(5)
     es.create_index()
 

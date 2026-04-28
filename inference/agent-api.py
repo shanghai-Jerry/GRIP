@@ -1,51 +1,81 @@
 import json
 import re
 import os
+import sys
 import argparse
 import torch.distributed as dist
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 from typing import List, Dict, Tuple
 from beir.retrieval.search.lexical.elastic_search import ElasticSearch
 from tqdm import tqdm
 import math
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Ensure UTF-8 encoding for stdin/stdout to support multibyte characters (e.g., Chinese)
+if hasattr(sys.stdin, 'reconfigure'):
+    sys.stdin.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+# Improve terminal input handling for multibyte characters (e.g., Chinese)
+try:
+    import readline  # Enables better line editing on Unix-like systems
+    # Configure readline for better multibyte character support
+    readline.parse_and_bind('set input-meta on')
+    readline.parse_and_bind('set output-meta on')
+    readline.parse_and_bind('set convert-meta off')
+    readline.parse_and_bind('set editing-mode emacs')
+    readline.parse_and_bind('set enable-keypad on')
+except ImportError:
+    pass  # readline not available on Windows, use fallback
+
+try:
+    from openai import OpenAI
+except ImportError:
+    raise ImportError("Please install openai package: pip install openai")
+
+# ==========================================
+# Load .env file if exists
+# ==========================================
+env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(env_file):
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
 
 # ==========================================
 # Argument Parsing
 # ==========================================
-parser = argparse.ArgumentParser(description="Distributed GRIP Evaluation")
-parser.add_argument("--model_path", type=str, required=True, help="Path to the model directory")
-parser.add_argument("--input_file", type=str, required=True, help="Path to the input JSONL file")
-parser.add_argument("--output_file", type=str, required=True, help="Path to the output JSONL file")
+parser = argparse.ArgumentParser(description="Distributed GRIP Evaluation via API")
+parser.add_argument("--model_path", type=str, default=None, help="Path to the tokenizer directory (optional, for apply_chat_template)")
+parser.add_argument("--api_base", type=str, default=os.environ.get("API_BASE"), help="API base URL, e.g., http://localhost:8000/v1")
+parser.add_argument("--api_key", type=str, default=os.environ.get("API_KEY", "EMPTY"), help="API key (can also set via .env file)")
+parser.add_argument("--api_model", type=str, default=os.environ.get("API_MODEL"), help="Model name for API calls")
+parser.add_argument("--input_file", type=str, help="Path to the input JSONL file (required for batch mode)")
+parser.add_argument("--output_file", type=str, help="Path to the output JSONL file (required for batch mode)")
 parser.add_argument("--max_round", type=int, default=4, help="Maximum number of reasoning rounds")
 parser.add_argument("--batch_size", type=int, default=32, help="Batch size for inference")
+parser.add_argument("--api_max_workers", type=int, default=8, help="Max concurrent workers for API calls")
+parser.add_argument("--interactive", "-i", action="store_true", help="Enable interactive Q&A mode")
 
 # Use parse_known_args to avoid potential conflicts with torchrun arguments
 args, _ = parser.parse_known_args()
 
 # ==========================================
-# DDP Setup
+# DDP Setup (keep for data sharding & merging)
 # ==========================================
 if "LOCAL_RANK" in os.environ:
-    if torch.cuda.is_available():
-        dist.init_process_group(backend="nccl")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        dist.init_process_group(backend="gloo")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    dist.init_process_group(backend="gloo")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
 else:
     rank = 0
     world_size = 1
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 # Global cache and thread lock
 _retrieval_cache = {}
@@ -130,22 +160,18 @@ def batch_retrieve(queries: List[str]) -> List[str]:
     return results
 
 # ==========================================
-# Model Loading
+# API Client & Optional Tokenizer
 # ==========================================
-# Initialize tokenizer
-tokenizer = AutoTokenizer.from_pretrained(
-    args.model_path, use_fast=False, trust_remote_code=True
-)
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "left"
+client = OpenAI(base_url=args.api_base, api_key=args.api_key)
 
-# Load the full model directly
-model = AutoModelForCausalLM.from_pretrained(
-    args.model_path,
-    torch_dtype=torch.float16 if device.type == "mps" else torch.bfloat16,
-)
-model.to(device)
-model.eval()
+tokenizer = None
+if args.model_path:
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, use_fast=False, trust_remote_code=True
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
 INSTRUCTION_NORMAL = """
 Given the question and previous answers, as well as the following retrieved text, please provide the answer. If you are very confident on your answer, you can provide you answer follow by [ANSWER], and end with [SOLVED]. If you need more external knowledge, you should generate the temp answer follow by [INTERMEDIARY], and end with [RETRIEVE]. Besides, you need to generate the new query based on the original query and current temp answer.
@@ -187,6 +213,31 @@ Here is some retrieved relevant information along with some previous responses.
     {reference}
 """.strip()
 
+def _call_api(prompt: str, force_answer: bool = False) -> str:
+    """Call remote model via OpenAI-compatible API."""
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        print(f"[DEBUG] Calling API: base={args.api_base}, model={args.api_model}")
+        print(f"[DEBUG] messages: {messages}")
+        response = client.chat.completions.create(
+            model=args.api_model,
+            messages=messages,
+            max_tokens=65536,
+            temperature=0.7,
+            top_p=0.9,
+            stop=["<|endoftext|>", "<|end_of_text|>"],
+        )
+        # print(f"[DEBUG] Raw response: {response}")
+        content = response.choices[0].message.content or ""
+        print(f"======= API response Start =====\n{content} \n======= API response End =====\n")
+        
+        return content
+    except Exception as e:
+        import traceback
+        print(f"API call error: {str(e)}")
+        traceback.print_exc()
+        return ""
+
 def generate_responses(
     questions: List[str], ref_list: List[str] = None, ret_txt_list: List[str] = None,
     max_length: int = 2048, instructions_override: bool = False, force_answer: bool = False
@@ -197,44 +248,40 @@ def generate_responses(
     prompts = []
     for q, ref, rt in zip(questions, batch_ref, batch_ret):
         messages = [{"role": "user", "content": instruction.format(question=q, intermediary=ref, reference=rt)}]
-        if instructions_override or force_answer:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) + "[ANSWER]"
+        if tokenizer is not None:
+            if instructions_override or force_answer:
+                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) + "[ANSWER]"
+            else:
+                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompt = messages[0]["content"]
+            if instructions_override or force_answer:
+                prompt += "\n[ANSWER]"
         prompts.append(prompt)
 
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_length).to(device)
-    try:
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=128,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                stop_strings=["<|endoftext|>", "<|end_of_text|>"],
-                tokenizer=tokenizer,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        all_outputs = []
-        for i, out in enumerate(outputs):
-            text = tokenizer.decode(out, skip_special_tokens=False)
-            prompt_len = len(tokenizer.decode(inputs['input_ids'][i], skip_special_tokens=False))
-            response = text[prompt_len:].replace("<|endoftext|>", "").replace("<|end_of_text|>", "").strip()
-            if "[ANSWER]" not in response and "[INTERMEDIARY]" not in response:
-                all_outputs.append("[ANSWER]" + response)
-            else:
-                all_outputs.append(response)
-        return all_outputs
-    finally:
-        del inputs
-        if 'outputs' in locals():
-            del outputs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+    # Call API concurrently to improve throughput
+    responses = [""] * len(prompts)
+    with ThreadPoolExecutor(max_workers=args.api_max_workers) as executor:
+        future_to_idx = {
+            executor.submit(_call_api, p, force_answer): i
+            for i, p in enumerate(prompts)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                responses[idx] = future.result()
+            except Exception as e:
+                print(f"API future error: {str(e)}")
+                responses[idx] = ""
+
+    # Post-process
+    all_outputs = []
+    for response in responses:
+        if "[ANSWER]" not in response and "[INTERMEDIARY]" not in response:
+            all_outputs.append("[ANSWER]" + response)
+        else:
+            all_outputs.append(response)
+    return all_outputs
 
 class QuestionState:
     def __init__(self, question: str, index: int):
@@ -247,6 +294,7 @@ class QuestionState:
         self.final_answer = ""
         self.completed_round = -1
         self.answers = []
+        self.last_response = ""  # Store the last API response for debugging
 
 # Pre-compile regular expressions to improve performance
 ANSWER_PATTERN = re.compile(r"\[ANSWER\](.*?)\[SOLVED\]", re.DOTALL)
@@ -268,7 +316,7 @@ def extract_answer_from_response(response: str) -> str:
 def process_batch_round_optimized(
     batch_states: List[QuestionState], current_round: int, max_rounds: int
 ) -> List[QuestionState]:
-    """Optimized batch processing logic, keeping model inference unchanged"""
+    """Optimized batch processing logic, keeping inference unchanged"""
     active_states = [state for state in batch_states if not state.is_completed]
     if not active_states:
         return batch_states
@@ -285,6 +333,9 @@ def process_batch_round_optimized(
     retrieve_indices = []
     
     for i, (state, response) in enumerate(zip(active_states, responses)):
+        # Save the raw response for debugging/display
+        state.last_response = response
+        
         # Extract the answer of the current round and save to the array
         current_answer = extract_answer_from_response(response)
         state.answers.append(current_answer)
@@ -333,6 +384,8 @@ def process_questions_optimized(
      input_questions: List[str], output_file: str, max_rounds: int, 
      batch_size: int = 16, processed_questions: set = None
  ) -> List[dict]:
+    
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
     results = []
     round_completion_counts = [0] * max_rounds
@@ -388,6 +441,7 @@ def process_questions_optimized(
                     "question": state.question, 
                     "prediction": state.answers
                 }
+                print(f"[DEBUG] question: {state.question}\nanswers: {state.answers[len(state.answers) - 1]}")
                 results.append(record)
                 write_buffer.append(json.dumps(record, ensure_ascii=False) + "\n")
                 processed_questions.add(state.question)
@@ -418,6 +472,76 @@ def process_questions_optimized(
     print("="*50)
     
     return results
+
+def interactive_mode(max_rounds: int):
+    """Interactive Q&A mode with continuous questioning via terminal"""
+    # Improve readline for multibyte character support (e.g., Chinese)
+    try:
+        import readline
+        # Use emacs editing mode; can also set to 'vi'
+        readline.parse_and_bind('set editing-mode emacs')
+        # Ensure readline handles multibyte characters correctly
+        readline.parse_and_bind('set enable-keypad on')
+        # Disable completion to avoid conflicts
+        readline.parse_and_bind('set disable-completion on')
+    except Exception:
+        pass  # readline not available or configuration failed
+
+    print("=" * 60)
+    print("Interactive Q&A Mode (GRIP)")
+    print("=" * 60)
+    print("Enter your questions below. Type 'quit', 'exit', or 'q' to stop.")
+    print()
+
+    while True:
+        try:
+            question = input("Question: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting interactive mode.")
+            break
+
+        if not question:
+            continue
+
+        if question.lower() in ('quit', 'exit', 'q'):
+            print("Goodbye!")
+            break
+
+        state = QuestionState(question, 0)
+        print(f"\nProcessing: {question}")
+        print("-" * 60)
+
+        for round_idx in range(max_rounds):
+            current_round = round_idx + 1
+            print(f"\n[Round {current_round}/{max_rounds}]")
+
+            batch_states = process_batch_round_optimized([state], current_round, max_rounds)
+            
+            # Print new query if available
+            if state.last_response and "[RETRIEVE]" in state.last_response:
+                retrieve_match = RETRIEVE_PATTERN.search(state.last_response)
+                if retrieve_match:
+                    new_query = retrieve_match.group(1).strip()
+                    if new_query:
+                        print(f"  【New Query】 {new_query}")
+
+            if state.is_completed:
+                print(f"\n✓ Answer found in round {current_round}:")
+                print(f"  {state.final_answer}")
+                break
+
+            if state.ret_txt:
+                print(f"  【Retrieved context】 {state.ret_txt[:200]}{'...' if len(state.ret_txt) > 200 else ''}")
+
+            if current_round == max_rounds and not state.is_completed:
+                if state.answers:
+                    final = state.answers[-1]
+                    print(f"\n⚠ Max rounds reached. Last answer:")
+                    print(f"  {final}")
+                else:
+                    print(f"\n⚠ Max rounds reached without a final answer.")
+
+        print("=" * 60)
 
 def main(input_file: str, output_file: str, max_rounds: int, batch_size: int = 16):
     """Main function optimization: Includes automatic sharding and final result merging"""
@@ -483,7 +607,7 @@ def main(input_file: str, output_file: str, max_rounds: int, batch_size: int = 1
     # 6. Synchronize and wait for all processes
     print(f"Rank {rank}: Waiting for other processes to finish...")
     if dist.is_initialized():
-        dist.barrier()  # Block until all GPU processes reach this line
+        dist.barrier()  # Block until all processes reach this line
 
     # 7. Merge results (executed only on Rank 0)
     if rank == 0:
@@ -513,9 +637,18 @@ def main(input_file: str, output_file: str, max_rounds: int, batch_size: int = 1
             print(f"Error occurred during merging: {str(e)}")
 
 if __name__ == '__main__':
-    main(
-        input_file=args.input_file, 
-        output_file=args.output_file, 
-        max_rounds=args.max_round,
-        batch_size=args.batch_size
-    )
+    if args.interactive:
+        # Interactive mode: allow continuous Q&A via terminal
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        interactive_mode(max_rounds=args.max_round)
+    else:
+        # Batch mode: requires input_file and output_file
+        if not args.input_file or not args.output_file:
+            parser.error("Batch mode requires --input_file and --output_file")
+        main(
+            input_file=args.input_file,
+            output_file=args.output_file,
+            max_rounds=args.max_round,
+            batch_size=args.batch_size
+        )
